@@ -219,6 +219,20 @@ pub unsafe extern "C" fn GeoIP_delete(gi: *mut GeoIpDb) {
     }
 }
 
+/// Only IPv4 address strings are accepted.
+/// DNS hostnames are NOT resolved, passing a hostname returns NULL.
+///
+/// # Safety
+/// - `gi` must be NULL or a valid pointer returned by `GeoIP_new` / `GeoIP_open`.
+/// - `name` must be NULL or a valid pointer to a null-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn GeoIP_country_code_by_name(
+    gi: *mut GeoIpDb,
+    name: *const c_char,
+) -> *const c_char {
+    unsafe { GeoIP_country_code_by_addr(gi, name) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,18 +283,4 @@ mod tests {
         assert_eq!(db.lookup_country_id(0x00000000), Some(1));
         assert_eq!(db.lookup_country_id(0x80000000), Some(1));
     }
-}
-
-/// Only IPv4 address strings are accepted.
-/// DNS hostnames are NOT resolved, passing a hostname returns NULL.
-///
-/// # Safety
-/// - `gi` must be NULL or a valid pointer returned by `GeoIP_new` / `GeoIP_open`.
-/// - `name` must be NULL or a valid pointer to a null-terminated C string.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn GeoIP_country_code_by_name(
-    gi: *mut GeoIpDb,
-    name: *const c_char,
-) -> *const c_char {
-    unsafe { GeoIP_country_code_by_addr(gi, name) }
 }

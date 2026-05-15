@@ -14,6 +14,10 @@ type mode_t = c_uint;
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 const SHM_NAME_MAX: usize = 255;
+#[cfg(any(target_arch = "x86", test))]
+const DEV_SHM_PREFIX: &[u8] = b"/dev/shm/";
+#[cfg(any(target_arch = "x86", test))]
+const DEV_SHM_PREFIX_LEN: usize = DEV_SHM_PREFIX.len();
 const ENOSYS: c_int = 38;
 #[cfg(target_arch = "x86")]
 const EFAULT: c_int = 14;
@@ -109,6 +113,35 @@ unsafe fn sanitize_on_stack(name: *const c_char, buf: &mut [u8; SHM_NAME_MAX + 1
     buf.as_ptr() as *const c_char
 }
 
+/// Rewrites a `/dev/shm/<a>/<b>` path to `/dev/shm/<a>_<b>`.
+/// Returns `path` unchanged when it is not under `/dev/shm/`.
+///
+/// # Safety
+/// `path` must point to a valid null-terminated C string.
+#[cfg(any(target_arch = "x86", test))]
+unsafe fn sanitize_dev_shm_path(
+    path: *const c_char,
+    buf: &mut [u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1],
+) -> *const c_char {
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+
+    let name = match bytes.strip_prefix(DEV_SHM_PREFIX) {
+        Some(name) => name,
+        None => return path,
+    };
+
+    if !name.contains(&b'/') || name.len() > SHM_NAME_MAX - 1 {
+        return path;
+    }
+
+    buf[..DEV_SHM_PREFIX_LEN].copy_from_slice(DEV_SHM_PREFIX);
+    for (i, &byte) in name.iter().enumerate() {
+        buf[DEV_SHM_PREFIX_LEN + i] = if byte == b'/' { b'_' } else { byte };
+    }
+    buf[DEV_SHM_PREFIX_LEN + name.len()] = 0;
+    buf.as_ptr() as *const c_char
+}
+
 /// Opens a POSIX shared memory object.
 ///
 /// # Safety
@@ -178,7 +211,9 @@ mod stat_hooks {
             let real_fn: XstatFn = unsafe { std::mem::transmute(ptr) };
             return unsafe { real_fn(ver, path, buf) };
         }
-        let ret = unsafe { raw_syscall2(syscall_nr::STAT64, path as u32, buf as u32) };
+        let mut pbuf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let patched = unsafe { sanitize_dev_shm_path(path, &mut pbuf) };
+        let ret = unsafe { raw_syscall2(syscall_nr::STAT64, patched as u32, buf as u32) };
         set_errno_from_ret(ret)
     }
 
@@ -212,7 +247,9 @@ mod stat_hooks {
             let real_fn: LxstatFn = unsafe { std::mem::transmute(ptr) };
             return unsafe { real_fn(ver, path, buf) };
         }
-        let ret = unsafe { raw_syscall2(syscall_nr::LSTAT64, path as u32, buf as u32) };
+        let mut pbuf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let patched = unsafe { sanitize_dev_shm_path(path, &mut pbuf) };
+        let ret = unsafe { raw_syscall2(syscall_nr::LSTAT64, patched as u32, buf as u32) };
         set_errno_from_ret(ret)
     }
 
@@ -220,7 +257,9 @@ mod stat_hooks {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn __xstat(ver: c_int, path: *const c_char, buf: *mut c_void) -> c_int {
         if ver == _STAT_VER_LINUX && !path.is_null() && !buf.is_null() {
-            let ret = unsafe { raw_syscall2(syscall_nr::STAT64, path as u32, buf as u32) };
+            let mut pbuf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+            let patched = unsafe { sanitize_dev_shm_path(path, &mut pbuf) };
+            let ret = unsafe { raw_syscall2(syscall_nr::STAT64, patched as u32, buf as u32) };
             return set_errno_from_ret(ret);
         }
         type XstatFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_void) -> c_int;
@@ -254,7 +293,9 @@ mod stat_hooks {
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn __lxstat(ver: c_int, path: *const c_char, buf: *mut c_void) -> c_int {
         if ver == _STAT_VER_LINUX && !path.is_null() && !buf.is_null() {
-            let ret = unsafe { raw_syscall2(syscall_nr::LSTAT64, path as u32, buf as u32) };
+            let mut pbuf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+            let patched = unsafe { sanitize_dev_shm_path(path, &mut pbuf) };
+            let ret = unsafe { raw_syscall2(syscall_nr::LSTAT64, patched as u32, buf as u32) };
             return set_errno_from_ret(ret);
         }
         type LxstatFn = unsafe extern "C" fn(c_int, *const c_char, *mut c_void) -> c_int;
@@ -275,7 +316,7 @@ mod stat_hooks {
             return -1;
         }
         let ret = unsafe { raw_syscall2(syscall_nr::MKDIR, path as u32, mode) };
-        if ret == -(EEXIST as i32) {
+        if ret == -EEXIST {
             return 0;
         }
         set_errno_from_ret(ret)
@@ -338,7 +379,7 @@ mod tests {
     #[test]
     fn exactly_max_length() {
         let mut name = vec![b'/'];
-        name.extend(std::iter::repeat(b'a').take(SHM_NAME_MAX - 2));
+        name.extend(std::iter::repeat_n(b'a', SHM_NAME_MAX - 2));
         name.push(b'/');
         assert_eq!(name.len(), SHM_NAME_MAX);
 
@@ -351,10 +392,97 @@ mod tests {
     #[test]
     fn exceeds_max_length_passes_through() {
         let mut name = vec![b'/'];
-        name.extend(std::iter::repeat(b'a').take(SHM_NAME_MAX));
+        name.extend(std::iter::repeat_n(b'a', SHM_NAME_MAX));
         name.push(b'/');
         assert!(name.len() > SHM_NAME_MAX);
 
         assert_eq!(sanitize(&name), None);
+    }
+
+    fn sanitize_path(input: &[u8]) -> Option<Vec<u8>> {
+        let c_str = CString::new(input).unwrap();
+        let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let result = unsafe { sanitize_dev_shm_path(c_str.as_ptr(), &mut buf) };
+        if result == c_str.as_ptr() {
+            None
+        } else {
+            let out = unsafe { CStr::from_ptr(result) };
+            Some(out.to_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn dev_shm_embedded_slash_rewritten() {
+        assert_eq!(
+            sanitize_path(b"/dev/shm/sec/tss_sdk_bus_1"),
+            Some(b"/dev/shm/sec_tss_sdk_bus_1".to_vec())
+        );
+    }
+
+    #[test]
+    fn dev_shm_multiple_slashes_rewritten() {
+        assert_eq!(
+            sanitize_path(b"/dev/shm/a/b/c"),
+            Some(b"/dev/shm/a_b_c".to_vec())
+        );
+    }
+
+    #[test]
+    fn dev_shm_no_embedded_slash_passes_through() {
+        assert_eq!(sanitize_path(b"/dev/shm/simple"), None);
+    }
+
+    #[test]
+    fn non_dev_shm_path_passes_through() {
+        assert_eq!(sanitize_path(b"/etc/passwd"), None);
+        assert_eq!(sanitize_path(b"/home/neople/secsvr/zergsvr/zergsvr.pid"), None);
+    }
+
+    #[test]
+    fn dev_shm_empty_suffix_passes_through() {
+        assert_eq!(sanitize_path(b"/dev/shm/"), None);
+    }
+
+    #[test]
+    fn dev_shm_prefix_only_passes_through() {
+        assert_eq!(sanitize_path(b"/dev/shm"), None);
+    }
+
+    #[test]
+    fn dev_shm_exceeds_max_length_passes_through() {
+        let mut path = DEV_SHM_PREFIX.to_vec();
+        path.push(b'a');
+        path.push(b'/');
+        path.extend(std::iter::repeat_n(b'b', SHM_NAME_MAX));
+        assert!(path.len() - DEV_SHM_PREFIX_LEN > SHM_NAME_MAX);
+
+        assert_eq!(sanitize_path(&path), None);
+    }
+
+    #[test]
+    fn dev_shm_name_at_max_minus_one_rewritten() {
+        let mut path = DEV_SHM_PREFIX.to_vec();
+        path.push(b'a');
+        path.push(b'/');
+        path.extend(std::iter::repeat_n(b'b', SHM_NAME_MAX - 3));
+        assert_eq!(path.len() - DEV_SHM_PREFIX_LEN, SHM_NAME_MAX - 1);
+
+        let mut expected = DEV_SHM_PREFIX.to_vec();
+        expected.push(b'a');
+        expected.push(b'_');
+        expected.extend(std::iter::repeat_n(b'b', SHM_NAME_MAX - 3));
+
+        assert_eq!(sanitize_path(&path), Some(expected));
+    }
+
+    #[test]
+    fn dev_shm_name_at_max_passes_through() {
+        let mut path = DEV_SHM_PREFIX.to_vec();
+        path.push(b'a');
+        path.push(b'/');
+        path.extend(std::iter::repeat_n(b'b', SHM_NAME_MAX - 2));
+        assert_eq!(path.len() - DEV_SHM_PREFIX_LEN, SHM_NAME_MAX);
+
+        assert_eq!(sanitize_path(&path), None);
     }
 }
