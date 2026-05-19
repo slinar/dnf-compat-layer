@@ -37,6 +37,8 @@ Replaces embedded slashes in shared memory object names with underscores. Newer 
 
 Replaces `__xstat`, `__xstat64`, `__fxstat`, `__fxstat64`, `__lxstat`, `__lxstat64`. Calls the kernel directly through `int 0x80` syscalls instead of glibc wrappers.
 
+Applies the same slash-to-underscore rewrite to `/dev/shm/` paths. A `stat` on `/dev/shm/a/b` then resolves to `/dev/shm/a_b`.
+
 **mkdir**
 
 Treats `EEXIST` as success. The call does not fail when the target directory already exists.
