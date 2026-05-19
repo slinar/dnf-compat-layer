@@ -1,6 +1,8 @@
 //! glibc legacy compatible shared library.
 
 use std::ffi::{c_char, c_int, c_void, CStr};
+#[cfg(target_arch = "x86")]
+use std::ffi::{c_long, c_uint};
 use std::sync::OnceLock;
 
 const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
@@ -48,6 +50,22 @@ mod sys {
         ret
     }
 
+     #[inline]
+    pub unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> i32 {
+        let ret: i32;
+        unsafe {
+            std::arch::asm!(
+                "int $0x80",
+                inout("eax") nr as i32 => ret,
+                in("ebx") a1,
+                in("ecx") a2,
+                in("edx") a3,
+                options(nostack)
+            );
+        }
+        ret
+    }
+
     #[inline]
     pub fn set_errno_from_ret(ret: i32) -> c_int {
         if ret < 0 { super::set_errno(-ret) } else { ret }
@@ -63,6 +81,83 @@ macro_rules! dlsym_next {
             (!p.is_null()).then(|| unsafe { std::mem::transmute::<_, $ty>(p) })
         })
     }};
+}
+
+#[cfg(any(target_arch = "x86", test))]
+const O_CREAT: c_int = 0o100;
+#[cfg(any(target_arch = "x86", test))]
+const O_TMPFILE_BIT: c_int = 0o20_000_000;
+#[cfg(test)]
+const O_DIRECTORY: c_int = 0o200_000;
+
+#[cfg(any(target_arch = "x86", test))]
+fn open_needs_mode(flags: c_int) -> bool {
+    flags & O_CREAT != 0 || flags & O_TMPFILE_BIT == O_TMPFILE_BIT
+}
+
+#[cfg(any(target_arch = "x86", test))]
+fn is_dev_shm_path(bytes: &[u8]) -> bool {
+    bytes.len() > DEV_SHM_PREFIX_LEN && bytes.starts_with(DEV_SHM_PREFIX)
+}
+
+mod trace {
+    #[cfg(target_arch = "x86")]
+    use super::*;
+
+    #[cfg(target_arch = "x86")]
+    static PATH: OnceLock<Option<Box<[u8]>>> = OnceLock::new();
+
+    #[cfg(target_arch = "x86")]
+    fn trace_path() -> Option<&'static [u8]> {
+        PATH.get_or_init(|| match std::env::var("DNF_SHM_TRACE") {
+            Ok(v) if !v.is_empty() => {
+                let mut b = v.into_bytes();
+                b.push(0);
+                Some(b.into_boxed_slice())
+            }
+            _ => None,
+        })
+        .as_deref()
+    }
+
+    #[cfg(target_arch = "x86")]
+    pub fn emit(tag: &[u8], path_ptr: *const std::ffi::c_char, flags: i32, ret: i32) {
+        let Some(file) = trace_path() else { return };
+        
+        let mut tv = [0i32; 2];
+        unsafe { sys::syscall2(78, tv.as_mut_ptr() as usize, 0) };
+        let pid = unsafe { sys::syscall2(20, 0, 0) } as u32;
+        let pbytes: &[u8] = if path_ptr.is_null() {
+            b"(null)"
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(path_ptr) }.to_bytes()
+        };
+        
+        let mut line = [0u8; 512];
+
+        use std::io::Write;
+        let mut w = &mut line[..];
+        let _ = write!(w, "{}.{:06} {} {} fl=0x{:x} r={} ", 
+            tv[0], tv[1], pid, std::str::from_utf8(tag).unwrap_or("?"), flags, ret);
+        let _ = w.write_all(pbytes);
+        let _ = w.write_all(b"\n");
+        let mut n = 512 - w.len();
+        if n == 512 {
+            line[511] = b'\n';
+        } else if n > 0 && line[n - 1] != b'\n' {
+            line[n] = b'\n';
+            n += 1;
+        }
+
+        let fd = unsafe { sys::syscall3(5, file.as_ptr() as usize, 1089, 0o644) };
+        if fd >= 0 {
+            unsafe { sys::syscall3(4, fd as usize, line.as_ptr() as usize, n) };
+            unsafe { sys::syscall2(6, fd as usize, 0) };
+        }
+    }
+
+    #[cfg(not(target_arch = "x86"))]
+    pub fn emit(_tag: &[u8], _path: *const std::ffi::c_char, _flags: i32, _ret: i32) {}
 }
 
 /// # Safety
@@ -102,12 +197,10 @@ unsafe fn sanitize_dev_shm_path(
         return path;
     }
 
-    let total_len = DEV_SHM_PREFIX_LEN + name.len();
-    buf[..DEV_SHM_PREFIX_LEN].copy_from_slice(DEV_SHM_PREFIX);
-    buf[DEV_SHM_PREFIX_LEN..total_len].copy_from_slice(name);
-    buf[total_len] = 0;
+    buf[..bytes.len()].copy_from_slice(bytes);
+    buf[bytes.len()] = 0;
 
-    buf[DEV_SHM_PREFIX_LEN..total_len]
+    buf[DEV_SHM_PREFIX_LEN..bytes.len()]
         .iter_mut()
         .filter(|b| **b == b'/')
         .for_each(|b| *b = b'_');
@@ -121,7 +214,11 @@ pub unsafe extern "C" fn shm_open(name: *const c_char, oflag: c_int, mode: u32) 
     let Some(real_fn) = dlsym_next!(c"shm_open", FnPtr) else { return set_errno(ENOSYS); };
     
     let mut buf =[0u8; SHM_NAME_MAX + 1];
-    unsafe { real_fn(sanitize_on_stack(name, &mut buf), oflag, mode) }
+    
+    let patched = unsafe { sanitize_on_stack(name, &mut buf) };
+    let r = unsafe { real_fn(patched, oflag, mode) };
+    trace::emit(b"shm_open", patched, oflag, r);
+    r
 }
 
 #[unsafe(no_mangle)]
@@ -130,7 +227,11 @@ pub unsafe extern "C" fn shm_unlink(name: *const c_char) -> c_int {
     let Some(real_fn) = dlsym_next!(c"shm_unlink", FnPtr) else { return set_errno(ENOSYS); };
     
     let mut buf =[0u8; SHM_NAME_MAX + 1];
-    unsafe { real_fn(sanitize_on_stack(name, &mut buf)) }
+    
+    let patched = unsafe { sanitize_on_stack(name, &mut buf) };
+    let r = unsafe { real_fn(patched) };
+    trace::emit(b"shm_unlink", patched, 0, r);
+    r
 }
 
 #[cfg(target_arch = "x86")]
@@ -148,9 +249,9 @@ mod stat_hooks {
                     let mut pbuf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
                     let patched_path = unsafe { sanitize_dev_shm_path(path, &mut pbuf) };
                     
-                    return sys::set_errno_from_ret(unsafe {
-                        sys::syscall2(sys::$sys, patched_path as usize, buf as usize)
-                    });
+                    let ret = unsafe { sys::syscall2(sys::$sys, patched_path as usize, buf as usize) };
+                    trace::emit(b"stat", patched_path, 0, ret);
+                    return sys::set_errno_from_ret(ret);
                 }
                 type FnPtr = unsafe extern "C" fn(c_int, *const c_char, *mut c_void) -> c_int;
                 let Some(real_fn) = dlsym_next!($name, FnPtr) else { return set_errno(ENOSYS); };
@@ -186,11 +287,197 @@ mod stat_hooks {
     pub unsafe extern "C" fn mkdir(path: *const c_char, mode: c_uint) -> c_int {
         if path.is_null() { return set_errno(sys::EFAULT); }
         
+        let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+        if is_dev_shm_path(bytes) {
+            return 0; // 直接伪造成功，根本不调用底层 mkdir
+        }
+
         let ret = unsafe { sys::syscall2(sys::MKDIR, path as usize, mode as usize) };
         if ret == -(sys::EEXIST as i32) {
-            return 0; // treats EEXIST as success
+            return 0;
         }
         sys::set_errno_from_ret(ret)
+    }
+}
+
+#[cfg(target_arch = "x86")]
+mod path_hooks {
+    use super::*;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    /// 由于 libc 的 open 是不定参数，且签名多样，无法简单复用 dlsym_next! 宏，因此采用 AtomicPtr
+    #[inline]
+    unsafe fn resolve(slot: &AtomicPtr<c_void>, sym: *const c_char) -> *mut c_void {
+        let cached = slot.load(Ordering::Relaxed);
+        if !cached.is_null() { return cached; }
+        let r = unsafe { dlsym(RTLD_NEXT, sym) };
+        slot.store(r, Ordering::Relaxed);
+        r
+    }
+
+    #[inline]
+    unsafe fn patch(path: *const c_char, buf: &mut [u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1]) -> *const c_char {
+        if path.is_null() { path } else { unsafe { sanitize_dev_shm_path(path, buf) } }
+    }
+
+    macro_rules! impl_open_hook {
+        ($name:ident, $sym:literal $(, $dirfd:ident)?) => {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name($($dirfd: c_int,)? path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+                type Fn = unsafe extern "C" fn($($dirfd: c_int,)? *const c_char, c_int, c_uint) -> c_int;
+                static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+                let ptr = unsafe { resolve(&REAL, $sym.as_ptr()) };
+                if ptr.is_null() { return set_errno(ENOSYS); }
+                
+                let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+                let p = unsafe { patch(path, &mut buf) };
+                let m = if open_needs_mode(flags) { mode } else { 0 };
+                unsafe { std::mem::transmute::<_, Fn>(ptr)($($dirfd,)? p, flags, m) }
+            }
+        };
+    }
+
+    impl_open_hook!(open, c"open");
+    impl_open_hook!(open64, c"open64");
+    impl_open_hook!(openat, c"openat", dirfd);
+    impl_open_hook!(openat64, c"openat64", dirfd);
+
+    macro_rules! path_int_hook {
+        ($name:ident, $sym:literal, ($($an:ident: $at:ty),*)) => {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(path: *const c_char $(, $an: $at)*) -> c_int {
+                type Fn = unsafe extern "C" fn(*const c_char $(, $at)*) -> c_int;
+                static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+                let ptr = unsafe { resolve(&REAL, $sym.as_ptr()) };
+                if ptr.is_null() { return set_errno(ENOSYS); }
+                
+                let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+                let p = unsafe { patch(path, &mut buf) };
+                unsafe { std::mem::transmute::<_, Fn>(ptr)(p $(, $an)*) }
+            }
+        };
+    }
+
+    path_int_hook!(access, c"access", (mode: c_int));
+    path_int_hook!(euidaccess, c"euidaccess", (mode: c_int));
+    path_int_hook!(eaccess, c"eaccess", (mode: c_int));
+    path_int_hook!(unlink, c"unlink", ());
+    path_int_hook!(truncate, c"truncate", (length: c_long));
+    path_int_hook!(truncate64, c"truncate64", (length: i64));
+    path_int_hook!(creat, c"creat", (mode: c_uint));
+    path_int_hook!(creat64, c"creat64", (mode: c_uint));
+    path_int_hook!(__open_2, c"__open_2", (oflag: c_int));
+    path_int_hook!(__open64_2, c"__open64_2", (oflag: c_int));
+
+    macro_rules! fd_path_int_hook {
+        ($name:ident, $sym:literal, ($($an:ident: $at:ty),*)) => {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(dirfd: c_int, path: *const c_char $(, $an: $at)*) -> c_int {
+                type Fn = unsafe extern "C" fn(c_int, *const c_char $(, $at)*) -> c_int;
+                static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+                let ptr = unsafe { resolve(&REAL, $sym.as_ptr()) };
+                if ptr.is_null() { return set_errno(ENOSYS); }
+                
+                let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+                let p = unsafe { patch(path, &mut buf) };
+                unsafe { std::mem::transmute::<_, Fn>(ptr)(dirfd, p $(, $an)*) }
+            }
+        };
+    }
+
+    fd_path_int_hook!(faccessat, c"faccessat", (mode: c_int, flags: c_int));
+    fd_path_int_hook!(unlinkat, c"unlinkat", (flags: c_int));
+    fd_path_int_hook!(__openat_2, c"__openat_2", (oflag: c_int));
+    fd_path_int_hook!(__openat64_2, c"__openat64_2", (oflag: c_int));
+
+    macro_rules! path_ptr_hook {
+        ($name:ident, $sym:literal, ($($an:ident: $at:ty),*)) => {
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(path: *const c_char $(, $an: $at)*) -> *mut c_void {
+                type Fn = unsafe extern "C" fn(*const c_char $(, $at)*) -> *mut c_void;
+                static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+                let ptr = unsafe { resolve(&REAL, $sym.as_ptr()) };
+                if ptr.is_null() {
+                    set_errno(ENOSYS);
+                    return std::ptr::null_mut();
+                }
+                
+                let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+                let p = unsafe { patch(path, &mut buf) };
+                unsafe { std::mem::transmute::<_, Fn>(ptr)(p $(, $an)*) }
+            }
+        };
+    }
+
+    path_ptr_hook!(fopen, c"fopen", (mode: *const c_char));
+    path_ptr_hook!(fopen64, c"fopen64", (mode: *const c_char));
+    path_ptr_hook!(opendir, c"opendir", ());
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn statx(dirfd: c_int, path: *const c_char, flags: c_int, mask: c_uint, stat_buf: *mut c_void) -> c_int {
+        type Fn = unsafe extern "C" fn(c_int, *const c_char, c_int, c_uint, *mut c_void) -> c_int;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let ptr = unsafe { resolve(&REAL, c"statx".as_ptr()) };
+        if ptr.is_null() { return set_errno(ENOSYS); }
+        
+        let mut buf = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let p = unsafe { patch(path, &mut buf) };
+        unsafe { std::mem::transmute::<_, Fn>(ptr)(dirfd, p, flags, mask, stat_buf) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: c_uint) -> c_int {
+        if path.is_null() { return set_errno(sys::EFAULT); }
+        let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+        if is_dev_shm_path(bytes) { return 0; }
+        
+        type Fn = unsafe extern "C" fn(c_int, *const c_char, c_uint) -> c_int;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let ptr = unsafe { resolve(&REAL, c"mkdirat".as_ptr()) };
+        if ptr.is_null() { return set_errno(ENOSYS); }
+        unsafe { std::mem::transmute::<_, Fn>(ptr)(dirfd, path, mode) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn rename(old: *const c_char, new: *const c_char) -> c_int {
+        type Fn = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let ptr = unsafe { resolve(&REAL, c"rename".as_ptr()) };
+        if ptr.is_null() { return set_errno(ENOSYS); }
+        
+        let mut ob = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let mut nb = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let op = unsafe { patch(old, &mut ob) };
+        let np = unsafe { patch(new, &mut nb) };
+        unsafe { std::mem::transmute::<_, Fn>(ptr)(op, np) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn renameat(olddirfd: c_int, old: *const c_char, newdirfd: c_int, new: *const c_char) -> c_int {
+        type Fn = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char) -> c_int;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let ptr = unsafe { resolve(&REAL, c"renameat".as_ptr()) };
+        if ptr.is_null() { return set_errno(ENOSYS); }
+        
+        let mut ob = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let mut nb = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let op = unsafe { patch(old, &mut ob) };
+        let np = unsafe { patch(new, &mut nb) };
+        unsafe { std::mem::transmute::<_, Fn>(ptr)(olddirfd, op, newdirfd, np) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn renameat2(olddirfd: c_int, old: *const c_char, newdirfd: c_int, new: *const c_char, flags: c_uint) -> c_int {
+        type Fn = unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, c_uint) -> c_int;
+        static REAL: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+        let ptr = unsafe { resolve(&REAL, c"renameat2".as_ptr()) };
+        if ptr.is_null() { return set_errno(ENOSYS); }
+        
+        let mut ob = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let mut nb = [0u8; DEV_SHM_PREFIX_LEN + SHM_NAME_MAX + 1];
+        let op = unsafe { patch(old, &mut ob) };
+        let np = unsafe { patch(new, &mut nb) };
+        unsafe { std::mem::transmute::<_, Fn>(ptr)(olddirfd, op, newdirfd, np, flags) }
     }
 }
 
@@ -356,5 +643,71 @@ mod tests {
         assert_eq!(path.len() - DEV_SHM_PREFIX_LEN, SHM_NAME_MAX);
 
         assert_eq!(sanitize_path(&path), None);
+    }
+
+     #[test]
+    fn dev_shm_multiple_slashes_at_max_minus_one_rewritten() {
+        let mut name = vec![b'a', b'/', b'b', b'/', b'c', b'/'];
+        name.extend(std::iter::repeat(b'd').take(SHM_NAME_MAX - 1 - name.len()));
+        assert_eq!(name.len(), SHM_NAME_MAX - 1);
+
+        let mut path = DEV_SHM_PREFIX.to_vec();
+        path.extend_from_slice(&name);
+
+        let mut expected = DEV_SHM_PREFIX.to_vec();
+        expected.extend(name.iter().map(|&b| if b == b'/' { b'_' } else { b }));
+
+        assert_eq!(sanitize_path(&path), Some(expected));
+    }
+
+    #[test]
+    fn open_rdonly_needs_no_mode() {
+        assert!(!open_needs_mode(0));
+    }
+
+    #[test]
+    fn open_creat_needs_mode() {
+        assert!(open_needs_mode(O_CREAT));
+    }
+
+    #[test]
+    fn open_wronly_creat_needs_mode() {
+        assert!(open_needs_mode(1 | O_CREAT));
+    }
+
+    #[test]
+    fn open_tmpfile_needs_mode() {
+        assert!(open_needs_mode(O_TMPFILE_BIT | O_DIRECTORY));
+    }
+
+    #[test]
+    fn open_directory_only_needs_no_mode() {
+        assert!(!open_needs_mode(O_DIRECTORY));
+    }
+
+    #[test]
+    fn dev_shm_dir_is_dev_shm_path() {
+        assert!(is_dev_shm_path(b"/dev/shm/sec"));
+    }
+
+    #[test]
+    fn dev_shm_file_is_dev_shm_path() {
+        assert!(is_dev_shm_path(b"/dev/shm/sec/tss_sdk_bus_1"));
+    }
+
+    #[test]
+    fn non_dev_shm_is_not_dev_shm_path() {
+        assert!(!is_dev_shm_path(b"/etc/passwd"));
+    }
+
+    #[test]
+    fn dev_shm_prefix_only_is_not_dev_shm_path() {
+        assert!(!is_dev_shm_path(b"/dev/shm/"));
+        assert!(!is_dev_shm_path(b"/dev/shm"));
+    }
+
+    #[test]
+    fn dev_shm_lookalike_is_not_dev_shm_path() {
+        assert!(!is_dev_shm_path(b"/dev/shmfoo"));
     }
 }
