@@ -289,7 +289,7 @@ mod stat_hooks {
         
         let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
         if is_dev_shm_path(bytes) {
-            return 0; // 直接伪造成功，根本不调用底层 mkdir
+            return 0;
         }
 
         let ret = unsafe { sys::syscall2(sys::MKDIR, path as usize, mode as usize) };
@@ -305,7 +305,6 @@ mod path_hooks {
     use super::*;
     use std::sync::atomic::{AtomicPtr, Ordering};
 
-    /// 由于 libc 的 open 是不定参数，且签名多样，无法简单复用 dlsym_next! 宏，因此采用 AtomicPtr
     #[inline]
     unsafe fn resolve(slot: &AtomicPtr<c_void>, sym: *const c_char) -> *mut c_void {
         let cached = slot.load(Ordering::Relaxed);
